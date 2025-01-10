@@ -1,6 +1,6 @@
 /* FAudio - XAudio Reimplementation for FNA
  *
- * Copyright (c) 2011-2021 Ethan Lee, Luigi Auriemma, and the MonoGame Team
+ * Copyright (c) 2011-2024 Ethan Lee, Luigi Auriemma, and the MonoGame Team
  *
  * This software is provided 'as-is', without any express or implied warranty.
  * In no event will the authors be held liable for any damages arising from
@@ -39,6 +39,8 @@
 #define FACT_CONTENT_VERSION_3_4 45
 #define FACT_CONTENT_VERSION_3_1 44
 #define FACT_CONTENT_VERSION_3_0 43
+#define FACT_CONTENT_VERSION_2_4 41
+#define FACT_CONTENT_VERSION_2_0 37
 
 static inline int FACT_INTERNAL_SupportedContent(uint16_t version)
 {
@@ -64,6 +66,30 @@ static inline int FACT_INTERNAL_SupportedWBContent(uint16_t version)
 static inline float FACT_INTERNAL_CalculateAmplitudeRatio(float decibel)
 {
 	return (float) FAudio_pow(10.0, decibel / 2000.0);
+}
+
+static inline float FACT_INTERNAL_CalculateFilterFrequency(
+	float desiredFrequency,
+	uint32_t sampleRate
+) {
+	/* This is needed to convert linear frequencies to the value
+	 * FAudio_INTERNAL_FilterVoice expects, in order for it to actually
+	 * filter at the correct frequency.
+	 *
+	 * The formula is...
+	 *
+	 * (2 * sin(pi * (desired filter cutoff frequency) / sampleRate))
+	 *
+	 * ... but it behaves badly as the filter frequency gets too high as a
+	 * fraction of the sample rate, hence the mins.
+	 *
+	 * -@Woflox
+	 */
+	float freq = 2.0f * FAudio_sinf(
+		F3DAUDIO_PI *
+		FAudio_min(desiredFrequency / sampleRate, 0.5f)
+	);
+	return FAudio_min(freq, 1.0f);
 }
 
 static inline void FACT_INTERNAL_ReadFile(
@@ -390,12 +416,17 @@ void FACT_INTERNAL_GetNextWave(
 	{
 		const float rngQFactor = 1.0f / (
 			FACT_INTERNAL_rng() *
-			(evt->wave.maxQFactor - evt->wave.minQFactor)
+			(evt->wave.maxQFactor - evt->wave.minQFactor) +
+			evt->wave.minQFactor
 		);
-		const float rngFrequency = (
-			FACT_INTERNAL_rng() *
-			(evt->wave.maxFrequency - evt->wave.minFrequency)
-		) / 20000.0f;
+		const float rngFrequency = FACT_INTERNAL_CalculateFilterFrequency(
+			(
+				FACT_INTERNAL_rng() *
+				(evt->wave.maxFrequency - evt->wave.minFrequency) +
+				evt->wave.minFrequency
+			),
+			cue->parentBank->parentEngine->audio->master->master.inputSampleRate
+		);
 		if (trackInst->activeWave.wave != NULL)
 		{
 			/* Variation on Loop */
@@ -430,7 +461,18 @@ void FACT_INTERNAL_GetNextWave(
 	else
 	{
 		trackInst->upcomingWave.baseQFactor = 1.0f / (track->qfactor / 3.0f);
-		trackInst->upcomingWave.baseFrequency = track->frequency / 20000.0f;
+		trackInst->upcomingWave.baseFrequency = FACT_INTERNAL_CalculateFilterFrequency(
+			track->frequency,
+			cue->parentBank->parentEngine->audio->master->master.inputSampleRate
+		);
+
+		/* FIXME: For some reason the 0.67 Q Factor causes problems, but it's also
+		 * the only possible value until ~1 so just clamp it for now.
+		 */
+		trackInst->upcomingWave.baseQFactor = FAudio_min(
+			trackInst->upcomingWave.baseQFactor,
+			1.0f
+		);
 	}
 
 	/* Try to change loop counter at the very end */
@@ -473,7 +515,7 @@ uint8_t FACT_INTERNAL_CreateSound(FACTCue *cue, uint16_t fadeInMS)
 		/* Sound */
 		baseSound = cue->sound;
 	}
-	else
+	else if (cue->variation)
 	{
 		/* Variation */
 		if (cue->variation->flags == 3)
@@ -888,7 +930,7 @@ void FACT_INTERNAL_DestroySound(FACTSoundInstance *sound)
 	/* TODO: if (sound->parentCue->playingSounds == NULL) */
 	{
 		sound->parentCue->state |= FACT_STATE_STOPPED;
-		sound->parentCue->state &= ~(FACT_STATE_PLAYING | FACT_STATE_STOPPING);
+		sound->parentCue->state &= ~(FACT_STATE_PLAYING | FACT_STATE_PAUSED | FACT_STATE_STOPPING);
 		sound->parentCue->data->instanceCount -= 1;
 
 		FACT_INTERNAL_SendCueNotification(sound->parentCue, NOTIFY_CUESTOP, FACTNOTIFICATIONTYPE_CUESTOP);
@@ -898,12 +940,18 @@ void FACT_INTERNAL_DestroySound(FACTSoundInstance *sound)
 
 void FACT_INTERNAL_BeginFadeOut(FACTSoundInstance *sound, uint16_t fadeOutMS)
 {
+	/* FIXME: Even for 0ms it seems to want to be in STOPPING for one frame.
+ 	 * Should we still destroy but defer state changes to the next frame?
+   	 * -flibit
+     	 */
+#if 0
 	if (fadeOutMS == 0)
 	{
 		/* No fade? Screw it, just delete us */
 		FACT_INTERNAL_DestroySound(sound);
 		return;
 	}
+#endif
 
 	sound->fadeType = 2; /* Out */
 	sound->fadeStart = FAudio_timems();
@@ -985,21 +1033,21 @@ float FACT_INTERNAL_CalculateRPC(
 			}
 			else if (rpc->points[i].type == 1) /* Fast */
 			{
-				result += maxY * (1.0f - FAudio_pow(1.0f - FAudio_pow(deltaXNormalized, 1.0f / 1.5f), 1.5f));
+				result += maxY * (1.0f - FAudio_powf(1.0f - FAudio_powf(deltaXNormalized, 1.0f / 1.5f), 1.5f));
 			}
 			else if (rpc->points[i].type == 2) /* Slow */
 			{
-				result += maxY * (1.0f - FAudio_pow(1.0f - FAudio_pow(deltaXNormalized, 1.5f), 1.0f / 1.5f));
+				result += maxY * (1.0f - FAudio_powf(1.0f - FAudio_powf(deltaXNormalized, 1.5f), 1.0f / 1.5f));
 			}
 			else if (rpc->points[i].type == 3) /* SinCos */
 			{
 				if (maxY > 0.0f)
 				{
-					result += maxY * (1.0f - FAudio_pow(1.0f - FAudio_sqrtf(deltaXNormalized), 2.0f));
+					result += maxY * (1.0f - FAudio_powf(1.0f - FAudio_sqrtf(deltaXNormalized), 2.0f));
 				}
 				else
 				{
-					result += maxY * (1.0f - FAudio_sqrtf(1.0f - FAudio_pow(deltaXNormalized, 2.0f)));
+					result += maxY * (1.0f - FAudio_sqrtf(1.0f - FAudio_powf(deltaXNormalized, 2.0f)));
 				}
 			}
 			else
@@ -1092,7 +1140,10 @@ void FACT_INTERNAL_UpdateRPCs(
 			else if (rpc->parameter == RPC_PARAMETER_FILTERFREQUENCY)
 			{
 				/* Yes, just overwrite... */
-				data->rpcFilterFreq = rpcResult / 20000.0f;
+				data->rpcFilterFreq = FACT_INTERNAL_CalculateFilterFrequency(
+					rpcResult,
+					engine->audio->master->master.inputSampleRate
+				);
 			}
 			else if (rpc->parameter == RPC_PARAMETER_FILTERQFACTOR)
 			{
@@ -1617,7 +1668,7 @@ void FACT_INTERNAL_UpdateCue(FACTCue *cue)
 	FACTSoundInstance *sound;
 
 	/* Interactive sound selection */
-	if (!(cue->data->flags & 0x04) && cue->variation->flags == 3)
+	if (!(cue->data->flags & 0x04) && cue->variation && cue->variation->flags == 3)
 	{
 		/* Interactive */
 		if (cue->parentBank->parentEngine->variables[cue->variation->variable].accessibility & 0x04)
@@ -1722,8 +1773,12 @@ threadstart:
 
 			if (cue->state & FACT_STATE_PAUSED)
 			{
-				cue = cue->next;
-				continue;
+				/* Funky edge case where we need to keep updating even when paused */
+				if (!(cue->state & FACT_STATE_STOPPING))
+				{
+					cue = cue->next;
+					continue;
+				}
 			}
 
 			if (cue->playingSound != NULL)
@@ -1888,8 +1943,7 @@ void FACT_INTERNAL_OnBufferEnd(FAudioVoiceCallback *callback, void* pContext)
 	buffer.pContext = NULL;
 
 	/* Submit, finally. */
-	if (	entry->Format.wFormatTag == 0x1 ||
-		entry->Format.wFormatTag == 0x3	)
+	if (entry->Format.wFormatTag == 0x3)
 	{
 		bufferWMA.pDecodedPacketCumulativeBytes =
 			c->wave->parentBank->seekTables[c->wave->index].entries;
@@ -2022,8 +2076,8 @@ uint32_t FACT_INTERNAL_ParseAudioEngine(
 			rpcOffset,
 			dspPresetOffset,
 			dspParameterOffset;
-	uint16_t blob1Count, blob2Count;
-	uint8_t version, tool;
+	uint16_t blob1Count, blob2Count, tool;
+	uint8_t version;
 	uint8_t se;
 	uint32_t magic;
 	size_t memsize;
@@ -2031,12 +2085,6 @@ uint32_t FACT_INTERNAL_ParseAudioEngine(
 
 	uint8_t *ptr = (uint8_t*) pParams->pGlobalSettingsBuffer;
 	uint8_t *start = ptr;
-
-	/* FIXME: Should be recorded so we can return the correct error */
-	if (!pParams->pGlobalSettingsBuffer || pParams->globalSettingsBufferSize == 0)
-	{
-		return 0;
-	}
 
 	magic = read_u32(&ptr, 0);
 	se = magic == 0x58475346; /* Swap Endian */
@@ -2180,7 +2228,8 @@ uint32_t FACT_INTERNAL_ParseAudioEngine(
 		{
 			pEngine->dspPresetCodes[i] = (uint32_t) (ptr - start);
 			pEngine->dspPresets[i].accessibility = read_u8(&ptr);
-			pEngine->dspPresets[i].parameterCount = read_u32(&ptr, se);
+			pEngine->dspPresets[i].parameterCount = read_u16(&ptr, se);
+			ptr += 2; /* Unknown value */
 			pEngine->dspPresets[i].parameters = (FACTDSPParameter*) pEngine->pMalloc(
 				sizeof(FACTDSPParameter) *
 				pEngine->dspPresets[i].parameterCount
@@ -2245,13 +2294,6 @@ uint32_t FACT_INTERNAL_ParseAudioEngine(
 		FAudio_memcpy(pEngine->variableNames[i], ptr, memsize);
 		ptr += memsize;
 	}
-
-	/* Peristent Notifications */
-	pEngine->notifications = 0;
-	pEngine->cue_context = NULL;
-	pEngine->sb_context = NULL;
-	pEngine->wb_context = NULL;
-	pEngine->wave_context = NULL;
 
 	/* Store this pointer in case we're asked to free it */
 	if (pParams->globalSettingsFlags & FACT_FLAG_MANAGEDATA)
@@ -2321,8 +2363,9 @@ void FACT_INTERNAL_ParseTrackEvents(
 			track->events[i].wave.angle = read_u16(ptr, se);
 
 			/* Track Variation */
-			track->events[i].wave.complex.trackCount = read_u16(ptr, se);
-			track->events[i].wave.complex.variation = read_u16(ptr, se);
+			evtInfo = read_u32(ptr, se);
+			track->events[i].wave.complex.trackCount = evtInfo & 0xFFFF;
+			track->events[i].wave.complex.variation = (evtInfo >> 16) & 0xFFFF;
 			*ptr += 4; /* Unknown values */
 			track->events[i].wave.complex.tracks = (uint16_t*) pMalloc(
 				sizeof(uint16_t) *
@@ -2393,8 +2436,9 @@ void FACT_INTERNAL_ParseTrackEvents(
 			track->events[i].wave.variationFlags = read_u16(ptr, se);
 
 			/* Track Variation */
-			track->events[i].wave.complex.trackCount = read_u16(ptr, se);
-			track->events[i].wave.complex.variation = read_u16(ptr, se);
+			evtInfo = read_u32(ptr, se);
+			track->events[i].wave.complex.trackCount = evtInfo & 0xFFFF;
+			track->events[i].wave.complex.variation = (evtInfo >> 16) & 0xFFFF;
 			*ptr += 4; /* Unknown values */
 			track->events[i].wave.complex.tracks = (uint16_t*) pMalloc(
 				sizeof(uint16_t) *
@@ -2498,6 +2542,7 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 		cueNameIndexOffset,
 		soundOffset;
 	uint32_t entryCountAndFlags;
+	uint16_t filterData;
 	uint8_t platform;
 	size_t memsize;
 	uint16_t i, j, k, cur, tool;
@@ -2583,6 +2628,7 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 
 	/* WaveBank Name data */
 	FAudio_assert((ptr - start) == wavebankNameOffset);
+	ptr = start + wavebankNameOffset;
 	sb->wavebankNames = (char**) pEngine->pMalloc(
 		sizeof(char*) *
 		sb->wavebankCount
@@ -2745,19 +2791,18 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 					continue;
 				}
 
-				sb->sounds[i].tracks[j].filter = read_u8(&ptr);
-				if (sb->sounds[i].tracks[j].filter & 0x01)
+				filterData = read_u16(&ptr, se);
+				if (filterData & 0x0001)
 				{
 					sb->sounds[i].tracks[j].filter =
-						(sb->sounds[i].tracks[j].filter >> 1) & 0x02;
+						(filterData >> 1) & 0x02;
 				}
 				else
 				{
 					/* Huh...? */
 					sb->sounds[i].tracks[j].filter = 0xFF;
 				}
-
-				sb->sounds[i].tracks[j].qfactor = read_u8(&ptr);
+				sb->sounds[i].tracks[j].qfactor = (filterData >> 8) & 0xFF;
 				sb->sounds[i].tracks[j].frequency = read_u16(&ptr, se);
 			}
 
@@ -2786,45 +2831,55 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 
 	/* Simple Cue data */
 	FAudio_assert(cueSimpleCount == 0 || (ptr - start) == cueSimpleOffset);
-	for (i = 0; i < cueSimpleCount; i += 1, cur += 1)
+	if (cueSimpleCount > 0)
 	{
-		sb->cues[cur].flags = read_u8(&ptr);
-		sb->cues[cur].sbCode = read_u32(&ptr, se);
-		sb->cues[cur].transitionOffset = 0;
-		sb->cues[cur].instanceLimit = 0xFF;
-		sb->cues[cur].fadeInMS = 0;
-		sb->cues[cur].fadeOutMS = 0;
-		sb->cues[cur].maxInstanceBehavior = 0;
-		sb->cues[cur].instanceCount = 0;
+		ptr = start + cueSimpleOffset;
+
+		for (i = 0; i < cueSimpleCount; i += 1, cur += 1)
+		{
+			sb->cues[cur].flags = read_u8(&ptr);
+			sb->cues[cur].sbCode = read_u32(&ptr, se);
+			sb->cues[cur].transitionOffset = 0;
+			sb->cues[cur].instanceLimit = 0xFF;
+			sb->cues[cur].fadeInMS = 0;
+			sb->cues[cur].fadeOutMS = 0;
+			sb->cues[cur].maxInstanceBehavior = 0;
+			sb->cues[cur].instanceCount = 0;
+		}
 	}
 
 	/* Complex Cue data */
 	FAudio_assert(cueComplexCount == 0 || (ptr - start) == cueComplexOffset);
-	for (i = 0; i < cueComplexCount; i += 1, cur += 1)
+	if (cueComplexCount > 0)
 	{
-		sb->cues[cur].flags = read_u8(&ptr);
-		sb->cues[cur].sbCode = read_u32(&ptr, se);
-		sb->cues[cur].transitionOffset = read_u32(&ptr, se);
-		if (sb->cues[cur].transitionOffset == 0xFFFFFFFF)
-		{
-			/* FIXME: Why */
-			sb->cues[cur].transitionOffset = 0;
-		}
-		sb->cues[cur].instanceLimit = read_u8(&ptr);
-		sb->cues[cur].fadeInMS = read_u16(&ptr, se);
-		sb->cues[cur].fadeOutMS = read_u16(&ptr, se);
-		sb->cues[cur].maxInstanceBehavior = read_u8(&ptr) >> 3;
-		sb->cues[cur].instanceCount = 0;
+		ptr = start + cueComplexOffset;
 
-		if (!(sb->cues[cur].flags & 0x04))
+		for (i = 0; i < cueComplexCount; i += 1, cur += 1)
 		{
-			/* FIXME: Is this the only way to get this...? */
-			sb->variationCount += 1;
-		}
-		if (sb->cues[cur].transitionOffset > 0)
-		{
-			/* FIXME: Is this the only way to get this...? */
-			sb->transitionCount += 1;
+			sb->cues[cur].flags = read_u8(&ptr);
+			sb->cues[cur].sbCode = read_u32(&ptr, se);
+			sb->cues[cur].transitionOffset = read_u32(&ptr, se);
+			if (sb->cues[cur].transitionOffset == 0xFFFFFFFF)
+			{
+				/* FIXME: Why */
+				sb->cues[cur].transitionOffset = 0;
+			}
+			sb->cues[cur].instanceLimit = read_u8(&ptr);
+			sb->cues[cur].fadeInMS = read_u16(&ptr, se);
+			sb->cues[cur].fadeOutMS = read_u16(&ptr, se);
+			sb->cues[cur].maxInstanceBehavior = read_u8(&ptr) >> 3;
+			sb->cues[cur].instanceCount = 0;
+
+			if (!(sb->cues[cur].flags & 0x04))
+			{
+				/* FIXME: Is this the only way to get this...? */
+				sb->variationCount += 1;
+			}
+			if (sb->cues[cur].transitionOffset > 0)
+			{
+				/* FIXME: Is this the only way to get this...? */
+				sb->transitionCount += 1;
+			}
 		}
 	}
 
@@ -2832,6 +2887,7 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 	if (sb->variationCount > 0)
 	{
 		FAudio_assert((ptr - start) == variationOffset);
+		ptr = start + variationOffset;
 		sb->variations = (FACTVariationTable*) pEngine->pMalloc(
 			sizeof(FACTVariationTable) *
 			sb->variationCount
@@ -2917,6 +2973,7 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 	if (sb->transitionCount > 0)
 	{
 		FAudio_assert((ptr - start) == transitionOffset);
+		ptr = start + transitionOffset;
 		sb->transitions = (FACTTransitionTable*) pEngine->pMalloc(
 			sizeof(FACTTransitionTable) *
 			sb->transitionCount
@@ -2964,6 +3021,7 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 	if (cueNameIndexOffset != -1)
 	{
 		FAudio_assert((ptr - start) == cueNameIndexOffset);
+		ptr = start + cueNameIndexOffset;
 		ptr += 6 * sb->cueCount; /* FIXME: index as assert value? */
 	}
 
@@ -2971,6 +3029,7 @@ uint32_t FACT_INTERNAL_ParseSoundBank(
 	if (cueNameOffset != -1)
 	{
 		FAudio_assert((ptr - start) == cueNameOffset);
+		ptr = start + cueNameOffset;
 		sb->cueNames = (char**) pEngine->pMalloc(
 			sizeof(char*) *
 			sb->cueCount
@@ -3058,7 +3117,17 @@ uint32_t FACT_INTERNAL_ParseWaveBank(
 	#define DOSWAP_64(x) x = FAudio_swap64BE(x)
 
 	fileOffset = offset;
-	READ(&header, sizeof(header))
+
+	FAudio_zero(&header, sizeof(header));
+	READ(&header.dwSignature, sizeof(header.dwSignature));
+	READ(&header.dwVersion, sizeof(header.dwVersion));
+	if (header.dwVersion > FACT_CONTENT_VERSION_2_4)
+	{
+		READ(&header.dwHeaderVersion, sizeof(header.dwHeaderVersion));
+	}
+
+	READ(&header.Segments, sizeof(header.Segments));
+
 	se = header.dwSignature == 0x57424E44;
 	if (se)
 	{
@@ -3076,12 +3145,20 @@ uint32_t FACT_INTERNAL_ParseWaveBank(
 		return -1; /* TODO: NOT XACT FILE */
 	}
 
-	if (!FACT_INTERNAL_SupportedContent(header.dwVersion))
+	/* We support all Wavebank versions - Restore when SoundBank support them also. */
+	/*if (!FACT_INTERNAL_SupportedContent(header.dwVersion))
+	{
+		return -2;
+	}
+	*/
+	if (	header.dwVersion < FACT_CONTENT_VERSION_2_4 ||
+		header.dwVersion > FACT_CONTENT_VERSION	)
 	{
 		return -2;
 	}
 
-	if (!FACT_INTERNAL_SupportedWBContent(header.dwHeaderVersion))
+	if (	header.dwVersion > FACT_CONTENT_VERSION_2_4 &&
+		!FACT_INTERNAL_SupportedWBContent(header.dwHeaderVersion)	)
 	{
 		return -3;
 	}
@@ -3282,12 +3359,17 @@ uint32_t FACT_INTERNAL_ParseWaveBank(
 		wb->seekTables = NULL;
 	}
 
-	/* TODO: WaveBank Entry Names
+	/* WaveBank Entry Names */
 	if (wbinfo.dwFlags & FACT_WAVEBANK_FLAGS_ENTRYNAMES)
 	{
 		SEEKSET(header.Segments[FACT_WAVEBANK_SEGIDX_ENTRYNAMES].dwOffset)
+		wb->waveBankNames = (char*) pEngine->pMalloc(64 * wbinfo.dwEntryCount);
+		READ(wb->waveBankNames, 64 * wbinfo.dwEntryCount);
 	}
-	*/
+	else
+	{
+		wb->waveBankNames = NULL;
+	}
 
 	/* Add to the Engine WaveBank list */
 	LinkedList_AddEntry(
